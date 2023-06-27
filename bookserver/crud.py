@@ -90,6 +90,8 @@ EVENT2TABLE = {
     "shortanswer": "shortanswer_answers",
     "unittest": "unittest_answers",
     "timedExam": "timed_exam",
+    "webwork": "webwork_answers",
+    "hparsonsAnswer": "microparsons_answers",
 }
 
 

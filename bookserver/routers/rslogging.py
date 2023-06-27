@@ -47,6 +47,7 @@ from ..crud import (
     EVENT2TABLE,
     delete_one_user_topic_practice,
     fetch_last_page,
+    fetch_chapter_for_subchapter,
     fetch_course,
     fetch_course_practice,
     fetch_one_user_topic_practice,
@@ -128,6 +129,7 @@ async def log_book_event(
     idx = await create_useinfo_entry(useinfo_entry)
     response_dict = dict(timestamp=entry.timestamp)
     if entry.event in EVENT2TABLE:
+        create_answer_table = True
         rcd = runestone_component_dict[EVENT2TABLE[entry.event]]
         if entry.event == "unittest":
             # info we need looks like: "act":"percent:100.0:passed:2:failed:0"
@@ -143,21 +145,22 @@ async def log_book_event(
             entry.correct = ppf[1] == "100.0"
             entry.percent = float(ppf[1])
         elif entry.event == "timedExam":
-            if entry.act == "start":
-                entry.correct = 0
-                entry.incorrect = 0
-                entry.skipped = 0
-                entry.time_taken = 0
+            if entry.act in ["start", "pause", "resume"]:
+                # We don't need these in the answer table but want the event to be timedExam.
+                create_answer_table = False
+        elif entry.event == "webwork" or entry.event == "hparsonsAnswer":
+            entry.answer = json.loads(useinfo_dict["answer"])
 
-        valid_table = rcd.validator.from_orm(entry)  # type: ignore
-        # Do server-side grading if needed.
-        if feedback := await is_server_feedback(entry.div_id, user.course_name):
-            # The grader should also be defined if there's feedback.
-            assert rcd.grader
-            response_dict.update(await rcd.grader(valid_table, feedback))
+        if create_answer_table:
+            valid_table = rcd.validator.from_orm(entry)  # type: ignore
+            # Do server-side grading if needed.
+            if feedback := await is_server_feedback(entry.div_id, user.course_name):
+                # The grader should also be defined if there's feedback.
+                assert rcd.grader
+                response_dict.update(await rcd.grader(valid_table, feedback))
 
-        ans_idx = await create_answer_table_entry(valid_table, entry.event)
-        rslogger.debug(ans_idx)
+            ans_idx = await create_answer_table_entry(valid_table, entry.event)
+            rslogger.debug(ans_idx)
 
     if idx:
         return make_json_response(status=status.HTTP_201_CREATED, detail=response_dict)
@@ -291,7 +294,6 @@ async def updatelastpage(
         # last_page_url is going to be .../ns/books/published/course/chapter/subchapter.html
         # We will treat the second to last element as the chapter and the final element
         # minus the .html as the subchapter
-        # TODO: PreTeXt books will nothave this url format!
         parts = request_data.last_page_url.split("/")
         if len(parts) < 2:
             rslogger.error(f"Unparseable page: {request_data.last_page_url}")
@@ -299,8 +301,23 @@ async def updatelastpage(
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"Unparseable page: {request_data.last_page_url}",
             )
-        lpd["last_page_chapter"] = parts[-2]
-        lpd["last_page_subchapter"] = ".".join(parts[-1].split(".")[:-1])
+
+        subchapter = ".".join(parts[-1].split(".")[:-1])
+        # if it is a PreTeXt book then the subchapter is a unique id with the whole book
+        # we can look it up from the chapter and subchapter tables.
+        if request_data.is_ptx_book:
+            course_row = await fetch_course(user.course_name)
+            chapter = await fetch_chapter_for_subchapter(
+                subchapter, course_row.base_course
+            )
+            rslogger.debug(
+                f"Got Chapter {chapter} for {subchapter} in {course_row.base_course}"
+            )
+            lpd["last_page_chapter"] = chapter
+        else:
+            lpd["last_page_chapter"] = parts[-2]
+
+        lpd["last_page_subchapter"] = subchapter
         lpd["last_page_accessed_on"] = datetime.utcnow()
         lpd["user_id"] = request.state.user.id
 
@@ -320,7 +337,8 @@ async def updatelastpage(
     practice_settings = await fetch_course_practice(user.course_name)
     if RS_info:
         values = json.loads(RS_info)
-        tz_offset = float(values["tz_offset"])
+
+        tz_offset = float(values.get("tz_offset", 0))
     else:
         tz_offset = 0
 
@@ -372,10 +390,17 @@ async def add_flashcard(
 # _getCompletionStatus
 # --------------------
 @router.get("/getCompletionStatus")
-async def getCompletionStatus(request: Request, lastPageUrl: str):
+async def getCompletionStatus(request: Request, lastPageUrl: str, isPtxBook: bool):
     if request.state.user:
-        last_page_chapter = lastPageUrl.split("/")[-2]
         last_page_subchapter = ".".join(lastPageUrl.split("/")[-1].split(".")[:-1])
+        if isPtxBook:
+            rslogger.debug(f"completion status for PTX book {lastPageUrl}")
+            course_row = await fetch_course(request.state.user.course_name)
+            last_page_chapter = await fetch_chapter_for_subchapter(
+                last_page_subchapter, course_row.base_course
+            )
+        else:
+            last_page_chapter = lastPageUrl.split("/")[-2]
         result = await fetch_user_sub_chapter_progress(
             request.state.user, last_page_chapter, last_page_subchapter
         )
